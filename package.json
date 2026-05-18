@@ -1,0 +1,22 @@
+{
+  "name": "pi-goal",
+  "version": "1.0.0",
+  "description": "Standing goal with judge loop for pi — auto-continues toward a goal until it's done",
+  "keywords": ["pi-package"],
+  "license": "MIT",
+  "author": "",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/prandelicious/pi-goal.git"
+  },
+  "type": "module",
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": ["./index.ts"],
+    "video": "",
+    "image": ""
+  }
+}
