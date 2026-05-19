@@ -47,14 +47,14 @@ ln -s "$PWD" ~/.pi/agent/extensions/pi-goal
 
 ## Configuration
 
-**Zero config required.** The judge uses pi's current model by default.
+**Zero config required.** The judge uses a dedicated lightweight model by default.
 
 Config file: `config.json` (next to `index.ts`)
 
 | Field | Default | Description |
 |---|---|---|
 | `maxTurns` | `20` | Continuation turns before auto-pause |
-| `judgeModel` | (current model) | Provider/model for the judge, e.g. `"openai/gpt-4o-mini"` |
+| `judgeModel` | `canopy-wave/minimax/minimax-m2.5` | Provider/model for the judge |
 | `taskModel` | (current model) | Provider/model for task execution |
 | `taskThinking` | (unchanged) | Thinking level for task execution |
 
@@ -67,6 +67,10 @@ Env vars override config.json:
 | `PI_GOAL_TASK_MODEL` | `taskModel` |
 | `PI_GOAL_TASK_THINKING` | `taskThinking` |
 
+### Debug logging
+
+Set `PI_GOAL_DEBUG=true` to write structured logs to `/tmp/pi-goal.log` (or set a custom path with `PI_GOAL_LOG`).
+
 ### When you might want a separate judge model
 
 If your primary model is expensive (e.g. Claude Opus), set a cheap model
@@ -77,7 +81,7 @@ export PI_GOAL_JUDGE_MODEL="openai/gpt-4o-mini"
 ```
 
 The model must be registered in pi (visible via `pi --list-models` or
-`/model`).
+`/model`). The default judge model is a fast, cost-effective option — override it if you prefer a different one.
 
 ## How it works
 
