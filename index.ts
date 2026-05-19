@@ -10,6 +10,9 @@
 // Env var fallback (overrides config.json):
 //   PI_GOAL_MAX_TURNS, PI_GOAL_JUDGE_MODEL
 //
+// Debug:
+//   PI_GOAL_DEBUG=true       — Enable debug log to /tmp/pi-goal.log (or PI_GOAL_LOG=path)
+//
 // Usage:
 //   /goal <text>      — Set a standing goal and kick off the first turn
 //   /goal status      — Show current goal, status, and turns used
@@ -17,12 +20,27 @@
 //   /goal resume      — Resume the loop (resets turn counter to zero)
 //   /goal clear       — Drop the goal entirely
 
+import { complete, type UserMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, Model, Api } from "@earendil-works/pi-coding-agent";
-import { readFileSync } from "node:fs";
+import { readFileSync, appendFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ENTRY_TYPE = "pi-goal";
+
+// ── Logger ────────────────────────────────────────────────────────────
+
+const DEBUG = process.env.PI_GOAL_DEBUG === "true";
+const LOG_PATH = process.env.PI_GOAL_LOG || "/tmp/pi-goal.log";
+
+function log(...args: unknown[]) {
+  if (!DEBUG) return;
+  try {
+    const ts = new Date().toISOString();
+    const line = `[${ts}] ${args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" ")}\n`;
+    appendFileSync(LOG_PATH, line);
+  } catch { /* best-effort */ }
+}
 
 // ── Config loader ─────────────────────────────────────────────────────
 
@@ -76,6 +94,7 @@ interface GoalState {
 interface JudgeVerdict {
   done: boolean;
   reason: string;
+  pauseForSafety?: boolean;
 }
 
 interface ClearedSentinel {
@@ -88,6 +107,7 @@ interface ClearedSentinel {
 let goal: GoalState | null = null;
 let previousModel: Model<Api> | undefined = undefined;
 let previousThinking: string | undefined = undefined;
+let activeAbortCleanup: (() => void) | undefined = undefined;
 
 // ── Persistence ───────────────────────────────────────────────────────
 
@@ -184,15 +204,20 @@ async function judge(
 ): Promise<JudgeVerdict> {
   const model = resolveModel(ctx, config.judgeModel) ?? ctx.model ?? null;
   if (!model) {
+    log("judge: no model available");
     return { done: false, reason: "No judge model available, continuing" };
   }
 
+  log("judge: model =", `${model.provider}/${model.id}`, "| response length =", assistantResponse.length);
+
   const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
   if (!auth.ok) {
+    log("judge: auth failed —", auth.error);
     return { done: false, reason: `No auth for judge model (${auth.error}), continuing` };
   }
 
   const prompt = `You are a goal-completion judge. Reply with strict JSON only.
+Do not include reasoning, markdown, prose, or <think> tags. Your first character must be { and your last character must be }.
 
 GOAL: ${goalText}
 
@@ -210,106 +235,210 @@ Rules:
 - If work clearly remains, mark done as false.`;
 
   try {
-    const baseUrl = model.baseUrl;
-    const isAnthropic = model.api === "anthropic-messages";
-
-    const url = isAnthropic
-      ? `${baseUrl}/v1/messages`
-      : `${baseUrl}/chat/completions`;
-
-    const body = isAnthropic
-      ? JSON.stringify({
-          model: model.id,
-          max_tokens: 200,
-          system: "You are a goal-completion judge. Reply with strict JSON only.",
-          messages: [{ role: "user", content: prompt }],
-        })
-      : JSON.stringify({
-          model: model.id,
-          messages: [{ role: "user", content: prompt }],
-          max_tokens: 200,
-          temperature: 0,
-        });
-
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-      ...auth.headers,
+    const userMessage: UserMessage = {
+      role: "user",
+      content: [{ type: "text", text: prompt }],
+      timestamp: Date.now(),
     };
 
-    if (auth.apiKey && !headers["Authorization"]) {
-      headers["Authorization"] = `Bearer ${auth.apiKey}`;
-    }
-    if (isAnthropic && auth.apiKey && !headers["x-api-key"]) {
-      headers["x-api-key"] = auth.apiKey;
-      headers["anthropic-version"] = headers["anthropic-version"] || "2023-06-01";
+    let providerStatus: number | undefined;
+    const response = await complete(
+      model,
+      {
+        systemPrompt: "You are a goal-completion judge. Reply with strict JSON only. Do not include reasoning, markdown, prose, or <think> tags.",
+        messages: [userMessage],
+      },
+      {
+        apiKey: auth.apiKey,
+        headers: auth.headers,
+        signal: ctx.signal,
+        maxTokens: 1000,
+        temperature: 0,
+        reasoning: "off",
+        onResponse: (res) => {
+          providerStatus = res.status;
+          log("judge: provider status =", res.status);
+        },
+      }
+    );
+
+    if (response.stopReason === "aborted") {
+      return {
+        done: false,
+        reason: "Judge call was interrupted; pausing goal loop for safety",
+        pauseForSafety: true,
+      };
     }
 
-    const res = await fetch(url, {
-      method: "POST",
-      headers,
-      body,
-      signal: ctx.signal,
-    });
-
-    if (!res.ok) {
-      return { done: false, reason: `Judge API error ${res.status}, continuing` };
+    if (providerStatus !== undefined && (providerStatus < 200 || providerStatus >= 300)) {
+      return {
+        done: false,
+        reason: `Judge API error ${providerStatus}; pausing goal loop for safety`,
+        pauseForSafety: true,
+      };
     }
 
-    const data: any = await res.json();
-    const text =
-      data.choices?.[0]?.message?.content ??
-      data.content?.find((c: any) => c.type === "text")?.text ??
-      "";
+    if (response.stopReason === "length") {
+      log("judge: length stop before JSON");
+      return {
+        done: false,
+        reason: "Judge response was truncated before JSON; pausing goal loop for safety",
+        pauseForSafety: true,
+      };
+    }
+
+    if (response.stopReason === "error") {
+      log("judge: error response =", response.errorMessage || "unknown error");
+      return {
+        done: false,
+        reason: `Judge error (${response.errorMessage || "unknown error"}); pausing goal loop for safety`,
+        pauseForSafety: true,
+      };
+    }
+
+    const text = response.content
+      .filter((c): c is { type: "text"; text: string } => c.type === "text")
+      .map((c) => c.text)
+      .join("");
+
+    log(
+      "judge: response meta =",
+      JSON.stringify({
+        stopReason: response.stopReason,
+        contentTypes: response.content.map((c: any) => c.type),
+        errorMessage: response.errorMessage,
+      })
+    );
+    log("judge: raw response =", text.slice(0, 500));
+
+    if (!text.trim()) {
+      log("judge: empty response");
+      return {
+        done: false,
+        reason: "Judge returned an empty response; pausing goal loop for safety",
+        pauseForSafety: true,
+      };
+    }
 
     const match = text.match(/\{[\s\S]*?\}/);
     if (!match) {
-      return { done: false, reason: "Judge returned non-JSON, continuing" };
+      log("judge: no JSON found in response");
+      return {
+        done: false,
+        reason: "Judge returned non-JSON; pausing goal loop for safety",
+        pauseForSafety: true,
+      };
     }
 
     const verdict = JSON.parse(match[0]);
+    log("judge: verdict =", verdict);
     return {
       done: Boolean(verdict.done),
       reason: String(verdict.reason || "Continuing toward goal"),
     };
   } catch (err: any) {
-    return { done: false, reason: `Judge error (${err.message}), continuing` };
+    log("judge: exception —", err.message);
+    if (ctx.signal?.aborted || err?.name === "AbortError") {
+      return {
+        done: false,
+        reason: "Judge call was interrupted; pausing goal loop for safety",
+        pauseForSafety: true,
+      };
+    }
+    return {
+      done: false,
+      reason: `Judge error (${err.message}); pausing goal loop for safety`,
+      pauseForSafety: true,
+    };
   }
 }
 
 // ── UI helpers ─────────────────────────────────────────────────────────
 
-const WIDGET_KEY = "pi-goal-widget";
-
-function goalEmoji(status: GoalState["status"]): string {
-  return status === "active" ? "⊙" : status === "paused" ? "⏸" : "✓";
+function elapsed(createdAt: number): string {
+  const secs = Math.floor((Date.now() - createdAt) / 1000);
+  if (secs < 60) return `${secs}s`;
+  const mins = Math.floor(secs / 60);
+  const rem = secs % 60;
+  return `${mins}m${rem}s`;
 }
 
 function formatStatus(g: GoalState): string {
-  return `${goalEmoji(g.status)} Goal (${g.turnsUsed}/${g.maxTurns}): ${g.text}`;
+  if (g.status === "active") {
+    return `◎ /goal active (${elapsed(g.createdAt)})`;
+  }
+  if (g.status === "paused") {
+    return `◎ /goal paused`;
+  }
+  return `◎ /goal done`;
 }
 
-function updateHud(pi: ExtensionAPI, ctx: ExtensionContext) {
-  if (!ctx.hasUI) return;
-  const theme = ctx.ui.theme;
+const STATUS_KEY = "pi-goal";
+let footerTimer: ReturnType<typeof setInterval> | undefined;
 
-  if (!goal) {
-    ctx.ui.setWidget(WIDGET_KEY, undefined);
-    return;
-  }
-
-  const emoji = goalEmoji(goal.status);
-  const line = `${emoji} Goal (${goal.turnsUsed}/${goal.maxTurns}): ${goal.text}`;
-
-  if (goal.status === "active") {
-    ctx.ui.setWidget(WIDGET_KEY, [theme.fg("accent", line)]);
-  } else if (goal.status === "paused" || goal.status === "done") {
-    ctx.ui.setWidget(WIDGET_KEY, [theme.fg("dim", line)]);
+function stopFooterTimer() {
+  if (footerTimer) {
+    clearInterval(footerTimer);
+    footerTimer = undefined;
   }
 }
 
-function clearHud(ctx: ExtensionContext) {
+function detachAbortHandler() {
+  if (activeAbortCleanup) {
+    activeAbortCleanup();
+    activeAbortCleanup = undefined;
+  }
+}
+
+function attachGoalAbortHandler(pi: ExtensionAPI, ctx: ExtensionContext) {
+  detachAbortHandler();
+  if (!ctx.signal) return;
+
+  const onAbort = () => {
+    if (!goal || goal.status !== "active") return;
+    log("agent aborted — pausing goal and stopping footer timer");
+    goal.status = "paused";
+    persistGoal(pi, goal);
+    ctx.ui.notify("⏸ Goal paused — agent run was interrupted. /goal resume to continue.", "warning");
+    setPausedStatus(ctx);
+    void restoreModelAndThinking(pi, ctx);
+  };
+
+  ctx.signal.addEventListener("abort", onAbort, { once: true });
+  activeAbortCleanup = () => ctx.signal?.removeEventListener("abort", onAbort);
+}
+
+function setGoalStatus(ctx: ExtensionContext, text: string, tone: "accent" | "dim" = "accent") {
   if (!ctx.hasUI) return;
-  ctx.ui.setWidget(WIDGET_KEY, undefined);
+  ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg(tone, text));
+}
+
+function startGoalActiveFooter(ctx: ExtensionContext) {
+  if (!ctx.hasUI || !goal) return;
+
+  // Use setStatus so pi's built-in footer stays intact and this extension only
+  // appends its own right-aligned footer status.
+  stopFooterTimer();
+  const update = () => {
+    if (goal?.status === "active") {
+      setGoalStatus(ctx, `◎ /goal active (${elapsed(goal.createdAt)})`);
+    }
+  };
+  update();
+  footerTimer = setInterval(update, 1000);
+}
+
+function setPausedStatus(ctx: ExtensionContext) {
+  detachAbortHandler();
+  stopFooterTimer();
+  setGoalStatus(ctx, "◎ /goal paused", "dim");
+}
+
+function clearGoalFooter(ctx: ExtensionContext) {
+  detachAbortHandler();
+  stopFooterTimer();
+  if (!ctx.hasUI) return;
+  ctx.ui.setStatus(STATUS_KEY, undefined);
 }
 
 // ── Command handlers ─────────────────────────────────────────────────
@@ -320,10 +449,10 @@ async function cmdStatus(pi: ExtensionAPI, ctx: ExtensionContext) {
     return;
   }
   ctx.ui.notify(formatStatus(goal), goal.status === "done" ? "success" : "info");
-  updateHud(pi, ctx);
 }
 
 async function cmdSet(text: string, pi: ExtensionAPI, ctx: ExtensionContext) {
+  log("cmd: set —", text);
   if (goal?.status === "active") {
     ctx.ui.notify("A goal is already active. /goal pause or /goal clear first.", "warning");
     return;
@@ -345,7 +474,7 @@ async function cmdSet(text: string, pi: ExtensionAPI, ctx: ExtensionContext) {
   persistGoal(pi, goal);
   ctx.ui.notify(`⊙ Goal set (${goal.maxTurns}-turn budget): ${text}`, "info");
 
-  updateHud(pi, ctx);
+  startGoalActiveFooter(ctx);
 
   // Switch to task model if configured
   if (config.taskModel) {
@@ -357,6 +486,7 @@ async function cmdSet(text: string, pi: ExtensionAPI, ctx: ExtensionContext) {
 }
 
 async function cmdPause(pi: ExtensionAPI, ctx: ExtensionContext) {
+  log("cmd: pause");
   if (!goal) {
     ctx.ui.notify("No active goal to pause.", "warning");
     return;
@@ -368,11 +498,12 @@ async function cmdPause(pi: ExtensionAPI, ctx: ExtensionContext) {
   goal.status = "paused";
   persistGoal(pi, goal);
   ctx.ui.notify(`⏸ Goal paused — ${goal.turnsUsed}/${goal.maxTurns} turns used.`, "info");
-  updateHud(pi, ctx);
+  setPausedStatus(ctx);
   await restoreModelAndThinking(pi, ctx);
 }
 
 async function cmdResume(pi: ExtensionAPI, ctx: ExtensionContext) {
+  log("cmd: resume");
   if (!goal) {
     ctx.ui.notify("No goal to resume. Use /goal <text> to set one.", "warning");
     return;
@@ -390,16 +521,17 @@ async function cmdResume(pi: ExtensionAPI, ctx: ExtensionContext) {
   persistGoal(pi, goal);
   ctx.ui.notify(`⊙ Goal resumed (${goal.maxTurns} turns reset): ${goal.text}`, "info");
 
-  updateHud(pi, ctx);
-
   if (config.taskModel) {
     await switchToTaskModel(pi, ctx);
   }
+
+  startGoalActiveFooter(ctx);
 
   pi.sendUserMessage(`[Continuing toward your standing goal: ${goal.text}]`);
 }
 
 async function cmdClear(pi: ExtensionAPI, ctx: ExtensionContext) {
+  log("cmd: clear");
   if (!goal) {
     ctx.ui.notify("No goal to clear.", "info");
     return;
@@ -407,7 +539,7 @@ async function cmdClear(pi: ExtensionAPI, ctx: ExtensionContext) {
   goal = null;
   pi.appendEntry(ENTRY_TYPE, { status: "cleared", clearedAt: Date.now() } as ClearedSentinel);
   ctx.ui.notify("✗ Goal cleared.", "info");
-  clearHud(ctx);
+  clearGoalFooter(ctx);
   await restoreModelAndThinking(pi, ctx);
 }
 
@@ -434,26 +566,68 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     restoreGoal(ctx);
     if (goal) {
-      const emoji = goalEmoji(goal.status);
-      ctx.ui.notify(`${emoji} Restored goal (${goal.status}): ${goal.text}`, "info");
-      updateHud(pi, ctx);
+      log("session_start: restored goal —", goal.status, goal.text);
+      ctx.ui.notify(`◎ Restored goal (${goal.status}): ${goal.text}`, "info");
+    } else {
+      log("session_start: no goal to restore");
+    }
+
+    if (goal && goal.status === "active") {
+      startGoalActiveFooter(ctx);
+    } else if (goal && goal.status === "paused") {
+      setPausedStatus(ctx);
     }
   });
 
+  pi.on("agent_start", async (_event, ctx) => {
+    if (goal?.status === "active") {
+      attachGoalAbortHandler(pi, ctx);
+    }
+  });
+
+  pi.on("session_shutdown", async () => {
+    detachAbortHandler();
+    stopFooterTimer();
+  });
+
   pi.on("agent_end", async (event, ctx) => {
-    if (!goal || goal.status !== "active") return;
+    detachAbortHandler();
+
+    if (!goal || goal.status !== "active") {
+      log("agent_end: skipped (no active goal)");
+      return;
+    }
+
+    log("agent_end: evaluating turn", goal.turnsUsed + 1, "of", goal.maxTurns);
 
     const lastResponse = getLastAssistantText(event.messages);
-    if (!lastResponse) return;
+    if (!lastResponse) {
+      log("agent_end: no assistant text found in messages — stopping loop");
+      return;
+    }
+
+    log("agent_end: response preview =", lastResponse.slice(0, 200));
 
     const verdict = await judge(goal.text, lastResponse, ctx);
+    log("agent_end: verdict =", verdict);
 
     if (verdict.done) {
       goal.status = "done";
       persistGoal(pi, goal);
-      ctx.ui.notify(`✓ Goal achieved: ${verdict.reason}`, "success");
-      updateHud(pi, ctx);
+      ctx.ui.notify(`◎ Goal achieved: ${verdict.reason}`, "success");
+      clearGoalFooter(ctx);
       await restoreModelAndThinking(pi, ctx);
+      log("agent_end: goal marked done —", verdict.reason);
+      return;
+    }
+
+    if (verdict.pauseForSafety) {
+      goal.status = "paused";
+      persistGoal(pi, goal);
+      ctx.ui.notify(`⏸ ${verdict.reason}. /goal resume to retry.`, "warning");
+      setPausedStatus(ctx);
+      await restoreModelAndThinking(pi, ctx);
+      log("agent_end: paused for judge safety fallback —", verdict.reason);
       return;
     }
 
@@ -467,13 +641,14 @@ export default function (pi: ExtensionAPI) {
         `⏸ Goal paused — ${goal.turnsUsed}/${goal.maxTurns} turns used. /goal resume to continue.`,
         "info"
       );
-      updateHud(pi, ctx);
+      setPausedStatus(ctx);
       await restoreModelAndThinking(pi, ctx);
+      log("agent_end: max turns reached — paused");
       return;
     }
 
-    updateHud(pi, ctx);
     ctx.ui.notify(`↻ Continuing (${goal.turnsUsed}/${goal.maxTurns}): ${verdict.reason}`, "info");
+    log("agent_end: continuing —", verdict.reason);
     pi.sendUserMessage(`[Continuing toward your standing goal: ${goal.text}]`);
   });
 }
