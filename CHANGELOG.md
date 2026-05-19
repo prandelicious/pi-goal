@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Add debug logging via `PI_GOAL_DEBUG` and `PI_GOAL_LOG` env vars
+- Integrate `pi-ai` completion for judge evaluation
+- Set default judge model to `canopy-wave/minimax/minimax-m2.5`
+
 ## 1.0.0 (2026-05-18)
 
 - Initial release
