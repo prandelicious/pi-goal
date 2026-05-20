@@ -49,7 +49,7 @@ ln -s "$PWD" ~/.pi/agent/extensions/pi-goal
 
 **Zero config required.** The judge uses a dedicated lightweight model by default.
 
-Config file: `config.json` (next to `index.ts`)
+Config file: `~/.pi/agent/pi-goal.json`
 
 | Field | Default | Description |
 |---|---|---|
@@ -58,7 +58,7 @@ Config file: `config.json` (next to `index.ts`)
 | `taskModel` | (current model) | Provider/model for task execution |
 | `taskThinking` | (unchanged) | Thinking level for task execution |
 
-Env vars override config.json:
+Env vars override pi-goal.json:
 
 | Variable | Overrides |
 |---|---|

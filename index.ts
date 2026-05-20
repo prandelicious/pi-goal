@@ -1,13 +1,13 @@
 // pi-goal — Standing goal with judge loop for pi
 // Inspired by Hermes Agent's /goal and Codex CLI's goal feature.
 //
-// Config file: config.json (same directory as this extension)
+// Config file: ~/.pi/agent/pi-goal.json
 //   maxTurns       — budget before auto-pause (default 20)
 //   judgeModel     — provider/model-id for the judge (default: current model)
 //   taskModel      — provider/model-id for the task execution (default: current model)
 //   taskThinking   — thinking level for task execution (default: unchanged)
 //
-// Env var fallback (overrides config.json):
+// Env var fallback (overrides pi-goal.json):
 //   PI_GOAL_MAX_TURNS, PI_GOAL_JUDGE_MODEL
 //
 // Debug:
@@ -23,8 +23,7 @@
 import { complete, type UserMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, Model, Api } from "@earendil-works/pi-coding-agent";
 import { readFileSync, appendFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 
 const ENTRY_TYPE = "pi-goal";
 
@@ -55,8 +54,8 @@ function loadConfig(): GoalConfig {
   const defaults: GoalConfig = { maxTurns: 20, judgeModel: "", taskModel: "", taskThinking: "" };
 
   try {
-    const extDir = dirname(fileURLToPath(import.meta.url));
-    const configPath = join(extDir, "config.json");
+    const homeDir = process.env.HOME || process.env.USERPROFILE || "";
+    const configPath = join(homeDir, ".pi", "agent", "pi-goal.json");
     const raw = JSON.parse(readFileSync(configPath, "utf-8"));
     return {
       maxTurns: raw.maxTurns ?? defaults.maxTurns,
