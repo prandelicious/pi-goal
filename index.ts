@@ -356,11 +356,14 @@ Rules:
 // ── UI helpers ─────────────────────────────────────────────────────────
 
 function elapsed(createdAt: number): string {
-  const secs = Math.floor((Date.now() - createdAt) / 1000);
-  if (secs < 60) return `${secs}s`;
-  const mins = Math.floor(secs / 60);
-  const rem = secs % 60;
-  return `${mins}m${rem}s`;
+  const totalSecs = Math.floor((Date.now() - createdAt) / 1000);
+  const hrs = Math.floor(totalSecs / 3600);
+  const mins = Math.floor((totalSecs % 3600) / 60);
+  const secs = totalSecs % 60;
+
+  if (hrs > 0) return `${hrs}h${mins}m${secs}s`;
+  if (mins > 0) return `${mins}m${secs}s`;
+  return `${secs}s`;
 }
 
 function formatStatus(g: GoalState): string {
@@ -614,7 +617,11 @@ export default function (pi: ExtensionAPI) {
     if (verdict.done) {
       goal.status = "done";
       persistGoal(pi, goal);
-      ctx.ui.notify(`◎ Goal achieved: ${verdict.reason}`, "success");
+      const turnsUsed = goal.turnsUsed + 1; // +1 for the current/final turn
+      ctx.ui.notify(
+        `◎ Goal achieved in ${elapsed(goal.createdAt)} (${turnsUsed}/${goal.maxTurns} turns): ${verdict.reason}`,
+        "success"
+      );
       clearGoalFooter(ctx);
       await restoreModelAndThinking(pi, ctx);
       log("agent_end: goal marked done —", verdict.reason);
