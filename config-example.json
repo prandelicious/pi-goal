@@ -1,6 +1,8 @@
 {
+  "autoContinue": false,
   "maxTurns": 20,
   "judgeModel": "canopy-wave/minimax/minimax-m2.5",
   "taskModel": "",
-  "taskThinking": ""
+  "taskThinking": "",
+  "showPlan": false
 }

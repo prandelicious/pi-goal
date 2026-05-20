@@ -1,7 +1,7 @@
 {
   "name": "pi-goal",
   "version": "1.0.0",
-  "description": "Standing goal with judge loop for pi — auto-continues toward a goal until it's done",
+  "description": "Codex-style durable goal state for pi",
   "keywords": ["pi-package"],
   "license": "MIT",
   "author": "",
